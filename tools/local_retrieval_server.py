@@ -5,8 +5,6 @@ import os
 import warnings
 from typing import List, Dict, Optional
 import argparse
-import glob
-import pickle
 
 import faiss
 import torch
@@ -213,14 +211,12 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
-        
-        if config.use_sharded_index:
-            self._load_sharded_index(config)
-        else:
-            self.index = faiss.read_index(self.index_path)
-            
+        self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
-            self._setup_gpu_index(config)
+            co = faiss.GpuMultipleClonerOptions()
+            co.useFloat16 = True
+            co.shard = True
+            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
@@ -233,191 +229,6 @@ class DenseRetriever(BaseRetriever):
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
 
-    def _load_sharded_index(self, config):
-        """Load index from sharded pickle files and transfer to GPU incrementally."""
-        def pickle_load(path):
-            with open(path, 'rb') as f:
-                reps, lookup = pickle.load(f)
-            return np.array(reps), lookup
-        
-        index_files = glob.glob(self.index_path)
-        print(f'Sharded loading: found {len(index_files)} files matching pattern: {self.index_path}')
-        
-        if not index_files:
-            raise ValueError(f"No files found matching pattern: {self.index_path}")
-        
-        # Load first shard to initialize index
-        print("Loading first shard...")
-        p_reps_0, p_lookup_0 = pickle_load(index_files[0])
-        
-        # Create initial FAISS index
-        dimension = p_reps_0.shape[1]
-        
-        # Check if we should use GPU transfer per shard
-        if config.faiss_gpu:
-            num_gpus = faiss.get_num_gpus()
-            if num_gpus > 0:
-                print(f"🚀 Using incremental GPU transfer approach on {num_gpus} GPU(s)")
-                self.index = self._create_gpu_index_incrementally(index_files, dimension)
-                return
-        
-        # Fallback to CPU approach
-        print("Using CPU FAISS index")
-        self.index = faiss.IndexFlatIP(dimension)
-        self.index.add(p_reps_0)
-        self.lookup = list(p_lookup_0)
-        
-        # Load remaining shards incrementally
-        if len(index_files) > 1:
-            print(f"Loading remaining {len(index_files)-1} shards...")
-            for i, index_file in enumerate(tqdm(index_files[1:], desc='Loading shards')):
-                p_reps, p_lookup = pickle_load(index_file)
-                self.index.add(p_reps)
-                self.lookup.extend(p_lookup)
-        
-        print(f"✅ Sharded index loaded: {self.index.ntotal} vectors, {dimension} dimensions")
-
-    def _create_gpu_index_incrementally(self, index_files, dimension):
-        """Create GPU index by transferring shards one by one."""
-        def pickle_load(path):
-            with open(path, 'rb') as f:
-                reps, lookup = pickle.load(f)
-            return np.array(reps), lookup
-        
-        num_gpus = faiss.get_num_gpus()
-        
-        # Create empty GPU index
-        if num_gpus == 1:
-            print("Creating single GPU index with incremental transfer...")
-            res = faiss.StandardGpuResources()
-            res.setTempMemory(4 * 1024 * 1024 * 1024)  # 4GB temp memory
-            
-            # Create empty GPU index (correct API)
-            config_gpu = faiss.GpuIndexFlatConfig()
-            config_gpu.useFloat16 = True
-            config_gpu.device = 0
-            gpu_index = faiss.GpuIndexFlatIP(res, dimension, config_gpu)
-        else:
-            print(f"Creating multi-GPU index with incremental transfer...")
-            # For multi-GPU, we'll build separate indices and merge
-            gpu_indices = []
-            resources = []
-            for i in range(num_gpus):
-                res = faiss.StandardGpuResources()
-                res.setTempMemory(4 * 1024 * 1024 * 1024)  # 4GB per GPU
-                resources.append(res)
-                
-                config_gpu = faiss.GpuIndexFlatConfig()
-                config_gpu.useFloat16 = True
-                config_gpu.device = i
-                gpu_idx = faiss.GpuIndexFlatIP(res, dimension, config_gpu)
-                gpu_indices.append(gpu_idx)
-        
-        self.lookup = []
-        shard_count = 0
-        gpu_assignment = 0
-        
-        for index_file in tqdm(index_files, desc='Loading shards to GPU'):
-            try:
-                p_reps, p_lookup = pickle_load(index_file)
-                
-                if num_gpus == 1:
-                    # Add to single GPU
-                    gpu_index.add(p_reps)
-                else:
-                    # Round-robin across GPUs
-                    target_gpu = shard_count % num_gpus
-                    gpu_indices[target_gpu].add(p_reps)
-                
-                self.lookup.extend(p_lookup)
-                shard_count += 1
-                
-                print(f"✅ Shard {shard_count}/{len(index_files)} loaded to GPU {target_gpu if num_gpus > 1 else 0}")
-                
-                # Clean up CPU memory
-                del p_reps, p_lookup
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"❌ GPU OOM on shard {shard_count}. Falling back to CPU...")
-                    # Fall back to CPU for this and remaining shards
-                    return self._fallback_to_cpu_index(index_files, dimension)
-                else:
-                    raise e
-        
-        if num_gpus == 1:
-            print(f"✅ Incremental GPU index created: {gpu_index.ntotal} vectors")
-            return gpu_index
-        else:
-            # Merge multi-GPU indices
-            print("Merging multi-GPU indices...")
-            merged_index = faiss.IndexShards(dimension)
-            for gpu_idx in gpu_indices:
-                merged_index.add_shard(gpu_idx)
-            print(f"✅ Multi-GPU sharded index created: {merged_index.ntotal} vectors")
-            return merged_index
-
-    def _fallback_to_cpu_index(self, index_files, dimension):
-        """Fallback to CPU index if GPU transfer fails."""
-        def pickle_load(path):
-            with open(path, 'rb') as f:
-                reps, lookup = pickle.load(f)
-            return np.array(reps), lookup
-        
-        print("Building CPU index as fallback...")
-        cpu_index = faiss.IndexFlatIP(dimension)
-        self.lookup = []
-        
-        for index_file in tqdm(index_files, desc='Loading shards to CPU'):
-            p_reps, p_lookup = pickle_load(index_file)
-            cpu_index.add(p_reps)
-            self.lookup.extend(p_lookup)
-            del p_reps, p_lookup
-        
-        print(f"✅ CPU fallback index created: {cpu_index.ntotal} vectors")
-        return cpu_index
-
-    def _setup_gpu_index(self, config):
-        """Setup GPU index with memory management."""
-        # Skip if index is already on GPU (from incremental loading)
-        if hasattr(self.index, 'device') or isinstance(self.index, (faiss.GpuIndex, faiss.IndexShards)):
-            print("Index already on GPU, skipping transfer")
-            return
-            
-        num_gpus = faiss.get_num_gpus()
-        if num_gpus == 0:
-            print("No GPU found. Using CPU FAISS.")
-            return
-            
-        print(f"Index info: {self.index.ntotal} vectors, {self.index.d} dimensions")
-        print(f"Estimated index size: {self.index.ntotal * self.index.d * 4 / (1024**3):.1f} GB")
-        print(f"Setting up GPU FAISS on {num_gpus} GPU(s)...")
-        
-        try:
-            if num_gpus == 1:
-                # Single GPU with float16 and limited temp memory
-                print("Attempting single GPU with temp memory limit...")
-                res = faiss.StandardGpuResources()
-                # Set conservative temp memory (2GB should be enough for most operations)
-                res.setTempMemory(2 * 1024 * 1024 * 1024)  # 2GB
-                
-                co = faiss.GpuClonerOptions()
-                co.useFloat16 = True
-                self.index = faiss.index_cpu_to_gpu(res, 0, self.index, co)
-                print("✅ Index moved to single GPU with float16 and 2GB temp memory")
-            else:
-                # Multi-GPU sharding (your working approach)
-                co = faiss.GpuMultipleClonerOptions()
-                co.useFloat16 = True
-                co.shard = True
-                self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
-                print(f"✅ Index sharded across {num_gpus} GPUs with float16")
-        except RuntimeError as e:
-            print(f"❌ GPU setup failed: {e}")
-            print("📝 Falling back to CPU FAISS")
-            # Index stays on CPU
-
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
@@ -425,16 +236,7 @@ class DenseRetriever(BaseRetriever):
         scores, idxs = self.index.search(query_emb, k=num)
         idxs = idxs[0]
         scores = scores[0]
-        
-        # Handle sharded index lookup
-        if hasattr(self, 'lookup'):
-            # For sharded indices, map FAISS indices to document IDs
-            doc_ids = [self.lookup[idx] for idx in idxs]
-            results = load_docs(self.corpus, doc_ids)
-        else:
-            # For regular FAISS indices, use indices directly
-            results = load_docs(self.corpus, idxs)
-            
+        results = load_docs(self.corpus, idxs)
         if return_score:
             return results, scores.tolist()
         else:
@@ -511,7 +313,6 @@ class Config:
         dataset_path: str = "./data",
         data_split: str = "train",
         faiss_gpu: bool = True,
-        use_sharded_index: bool = False,
         retrieval_model_path: str = "./model",
         retrieval_pooling_method: str = "mean",
         retrieval_query_max_length: int = 256,
@@ -525,7 +326,6 @@ class Config:
         self.dataset_path = dataset_path
         self.data_split = data_split
         self.faiss_gpu = faiss_gpu
-        self.use_sharded_index = use_sharded_index
         self.retrieval_model_path = retrieval_model_path
         self.retrieval_pooling_method = retrieval_pooling_method
         self.retrieval_query_max_length = retrieval_query_max_length
@@ -598,9 +398,8 @@ async def access_endpoint(request: AccessRequest):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
-    parser.add_argument("--index_path", type=str, default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index", help="Corpus indexing file or glob pattern for sharded pickle files (e.g., /path/to/corpus.shard*.pkl).")
+    parser.add_argument("--index_path", type=str, default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index", help="Corpus indexing file.")
     parser.add_argument("--corpus_path", type=str, default="/home/peterjin/mnt/data/retrieval-corpus/wiki-18.jsonl", help="Local corpus file.")
-    parser.add_argument("--use_sharded_index", action="store_true", help="Use sharded pickle index files instead of single FAISS index")
     parser.add_argument("--pages_path", type=str, default="xxx", help="Local page file.")
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
@@ -632,7 +431,6 @@ if __name__ == "__main__":
         corpus_path=args.corpus_path,
         retrieval_topk=args.topk,
         faiss_gpu=args.faiss_gpu,
-        use_sharded_index=args.use_sharded_index,
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
